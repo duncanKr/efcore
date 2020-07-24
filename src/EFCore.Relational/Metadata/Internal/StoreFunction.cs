@@ -29,6 +29,7 @@ namespace Microsoft.EntityFrameworkCore.Metadata.Internal
         {
             DbFunctions = new SortedDictionary<string, DbFunction>() { { dbFunction.ModelName, dbFunction } };
             IsBuiltIn = dbFunction.IsBuiltIn;
+            IsNullable = dbFunction.IsNullable;
             ReturnType = dbFunction.StoreType;
 
             Parameters = new StoreFunctionParameter[dbFunction.Parameters.Count];
@@ -49,6 +50,9 @@ namespace Microsoft.EntityFrameworkCore.Metadata.Internal
 
         /// <inheritdoc />
         public virtual bool IsBuiltIn { get; }
+
+        /// <inheritdoc />
+        public virtual bool IsNullable { get; }
 
         /// <inheritdoc />
         public virtual string ReturnType { get; }
