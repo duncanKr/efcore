@@ -549,16 +549,26 @@ namespace Microsoft.EntityFrameworkCore.Query
                     return null;
                 }
 
-                if (subqueryTranslation.ShaperExpression is EntityShaperExpression entityShaperExpression)
+                var shaperExpression = subqueryTranslation.ShaperExpression;
+                var innerExpression = shaperExpression;
+                Type convertedType = null;
+                if (shaperExpression is UnaryExpression unaryExpression
+                    && unaryExpression.NodeType == ExpressionType.Convert)
                 {
-                    return new EntityReferenceExpression(subqueryTranslation);
+                    convertedType = unaryExpression.Type;
+                    innerExpression = unaryExpression.Operand;
                 }
 
-                if (!(subqueryTranslation.ShaperExpression is ProjectionBindingExpression
-                    || (subqueryTranslation.ShaperExpression is UnaryExpression unaryExpression
-                        && unaryExpression.NodeType == ExpressionType.Convert
-                        && unaryExpression.Type.MakeNullable() == unaryExpression.Operand.Type
-                        && unaryExpression.Operand is ProjectionBindingExpression)
+                if (innerExpression is EntityShaperExpression entityShaperExpression
+                    && (convertedType == null
+                        || convertedType.IsAssignableFrom(entityShaperExpression.Type)))
+                {
+                    return new EntityReferenceExpression(subqueryTranslation.UpdateShaperExpression(innerExpression));
+                }
+
+                if (!((innerExpression is ProjectionBindingExpression
+                        && (convertedType == null
+                            || convertedType.MakeNullable() == innerExpression.Type))
                     || IsAggregateResultWithCustomShaper(methodCallExpression.Method)))
                 {
                     return null;
@@ -583,11 +593,11 @@ namespace Microsoft.EntityFrameworkCore.Query
                 SqlExpression scalarSubqueryExpression = new ScalarSubqueryExpression(subquery);
 
                 if (subqueryTranslation.ResultCardinality == ResultCardinality.SingleOrDefault
-                    && !subqueryTranslation.ShaperExpression.Type.IsNullableType())
+                    && !shaperExpression.Type.IsNullableType())
                 {
                     scalarSubqueryExpression = _sqlExpressionFactory.Coalesce(
                         scalarSubqueryExpression,
-                        (SqlExpression)Visit(subqueryTranslation.ShaperExpression.Type.GetDefaultValueConstant()));
+                        (SqlExpression)Visit(shaperExpression.Type.GetDefaultValueConstant()));
                 }
 
                 return scalarSubqueryExpression;
@@ -770,21 +780,18 @@ namespace Microsoft.EntityFrameworkCore.Query
                 var derivedType = entityType.GetDerivedTypes().SingleOrDefault(et => et.ClrType == typeBinaryExpression.TypeOperand);
                 if (derivedType != null)
                 {
-                    var concreteEntityTypes = derivedType.GetConcreteDerivedTypesInclusive().ToList();
                     var discriminatorProperty = entityType.GetDiscriminatorProperty();
                     if (discriminatorProperty == null)
                     {
                         // TPT
+                        var discriminatorValues = derivedType.GetTptDiscriminatorValues();
                         if (entityReferenceExpression.SubqueryEntity != null)
                         {
                             var entityShaper = (EntityShaperExpression)entityReferenceExpression.SubqueryEntity.ShaperExpression;
                             var entityProjection = (EntityProjectionExpression)Visit(entityShaper.ValueBufferExpression);
                             var subSelectExpression = (SelectExpression)entityReferenceExpression.SubqueryEntity.QueryExpression;
 
-                            var predicate = entityProjection.EntityTypeIdentifyingExpressionMap
-                                .Where(kvp => concreteEntityTypes.Contains(kvp.Key))
-                                .Select(kvp => kvp.Value)
-                                .Aggregate((l, r) => _sqlExpressionFactory.OrElse(l, r));
+                            var predicate = GeneratePredicateTPT(entityProjection);
 
                             subSelectExpression.ApplyPredicate(predicate);
                             subSelectExpression.ReplaceProjectionMapping(new Dictionary<ProjectionMember, Expression>());
@@ -802,16 +809,37 @@ namespace Microsoft.EntityFrameworkCore.Query
                             var entityProjection = (EntityProjectionExpression)Visit(
                                 entityReferenceExpression.ParameterEntity.ValueBufferExpression);
 
-                            return entityProjection.EntityTypeIdentifyingExpressionMap
-                                .Where(kvp => concreteEntityTypes.Contains(kvp.Key))
-                                .Select(kvp => kvp.Value)
-                                .Aggregate((l, r) => _sqlExpressionFactory.OrElse(l, r));
+                            return GeneratePredicateTPT(entityProjection);
+                        }
+
+                        SqlExpression GeneratePredicateTPT(EntityProjectionExpression entityProjectionExpression)
+                        {
+                            if (entityProjectionExpression.DiscriminatorExpression is CaseExpression caseExpression)
+                            {
+                                var matchingCaseWhenClauses = caseExpression.WhenClauses
+                                    .Where(wc => discriminatorValues.Contains((string)((SqlConstantExpression)wc.Result).Value))
+                                    .ToList();
+
+                                return matchingCaseWhenClauses.Count == 1
+                                    ? matchingCaseWhenClauses[0].Test
+                                    : matchingCaseWhenClauses.Select(e => e.Test)
+                                        .Aggregate((l, r) => _sqlExpressionFactory.OrElse(l, r));
+                            }
+
+                            return discriminatorValues.Count == 1
+                                ? _sqlExpressionFactory.Equal(
+                                    entityProjectionExpression.DiscriminatorExpression,
+                                    _sqlExpressionFactory.Constant(discriminatorValues[0]))
+                                : (SqlExpression)_sqlExpressionFactory.In(
+                                    entityProjectionExpression.DiscriminatorExpression,
+                                    _sqlExpressionFactory.Constant(discriminatorValues),
+                                    negated: false);
                         }
                     }
                     else
                     {
+                        var concreteEntityTypes = derivedType.GetConcreteDerivedTypesInclusive().ToList();
                         var discriminatorColumn = BindProperty(entityReferenceExpression, discriminatorProperty);
-
                         if (discriminatorColumn != null)
                         {
                             return concreteEntityTypes.Count == 1
@@ -924,8 +952,24 @@ namespace Microsoft.EntityFrameworkCore.Query
             if (entityReferenceExpression.SubqueryEntity != null)
             {
                 var entityShaper = (EntityShaperExpression)entityReferenceExpression.SubqueryEntity.ShaperExpression;
-                var innerProjection = ((EntityProjectionExpression)Visit(entityShaper.ValueBufferExpression)).BindProperty(property);
                 var subSelectExpression = (SelectExpression)entityReferenceExpression.SubqueryEntity.QueryExpression;
+
+                SqlExpression innerProjection;
+                var projectionBindingExpression = (ProjectionBindingExpression)entityShaper.ValueBufferExpression;
+                if (projectionBindingExpression.ProjectionMember != null)
+                {
+                    var entityProjectionExpression = (EntityProjectionExpression)subSelectExpression.GetMappedProjection(
+                        projectionBindingExpression.ProjectionMember);
+                    innerProjection = entityProjectionExpression.BindProperty(property);
+                }
+                else
+                {
+                    // This has to be index map since entities cannot map to just integer index
+                    var index = projectionBindingExpression.IndexMap[property];
+                    innerProjection = subSelectExpression.Projection[index].Expression;
+                    subSelectExpression.ClearProjection();
+                }
+
                 subSelectExpression.AddToProjection(innerProjection);
 
                 return new ScalarSubqueryExpression(subSelectExpression);
@@ -1169,9 +1213,9 @@ namespace Microsoft.EntityFrameworkCore.Query
 
                 result = Visit(primaryKeyProperties1.Select(p =>
                     {
-                    var comparison = Expression.Call(_objectEqualsMethodInfo,
-                        Expression.Convert(CreatePropertyAccessExpression(nonNullEntityReference, p), typeof(object)),
-                        Expression.Convert(Expression.Constant(null, p.ClrType.MakeNullable()), typeof(object)));
+                        var comparison = Expression.Call(_objectEqualsMethodInfo,
+                            Expression.Convert(CreatePropertyAccessExpression(nonNullEntityReference, p), typeof(object)),
+                            Expression.Convert(Expression.Constant(null, p.ClrType.MakeNullable()), typeof(object)));
 
                         return nodeType == ExpressionType.Equal
                             ? (Expression)comparison

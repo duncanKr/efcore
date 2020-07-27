@@ -38,6 +38,8 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
             { ExpressionType.GreaterThanOrEqual, ExpressionType.LessThanOrEqual },
         };
 
+        private const string DiscriminatorColumnAlias = "Discriminator";
+
         private readonly IDictionary<EntityProjectionExpression, IDictionary<IProperty, int>> _entityProjectionCache
             = new Dictionary<EntityProjectionExpression, IDictionary<IProperty, int>>();
 
@@ -208,8 +210,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                     }
                 }
 
-                var discriminatorExpressions = new Dictionary<IEntityType, SqlExpression>();
-
+                var caseWhenClauses = new List<CaseWhenClause>();
                 foreach (var derivedType in entityType.GetDerivedTypes())
                 {
                     var table = derivedType.GetViewOrTableMappings().Single(m => !tables.Contains(m.Table)).Table;
@@ -224,7 +225,9 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
 
                     if (!derivedType.IsAbstract())
                     {
-                        discriminatorExpressions[derivedType] = sqlExpressionFactory.IsNotNull(keyColumns[0]);
+                        caseWhenClauses.Add(new CaseWhenClause(
+                            sqlExpressionFactory.IsNotNull(keyColumns[0]),
+                            sqlExpressionFactory.Constant(derivedType.ShortName())));
                     }
 
                     var joinPredicate = joinColumns.Zip(keyColumns, (l, r) => sqlExpressionFactory.Equal(l, r))
@@ -234,7 +237,12 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                     _tables.Add(joinExpression);
                 }
 
-                var entityProjection = new EntityProjectionExpression(entityType, columns, discriminatorExpressions);
+                caseWhenClauses.Reverse();
+                var discriminatorExpression = caseWhenClauses.Count == 0
+                    ? null
+                    : sqlExpressionFactory.ApplyDefaultTypeMapping(
+                        sqlExpressionFactory.Case(caseWhenClauses, elseResult: null));
+                var entityProjection = new EntityProjectionExpression(entityType, columns, discriminatorExpression);
                 _projectionMapping[new ProjectionMember()] = entityProjection;
             }
         }
@@ -320,12 +328,9 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                         map[property] = AddToProjection(entityProjection.BindProperty(property));
                     }
 
-                    if (entityProjection.EntityTypeIdentifyingExpressionMap != null)
+                    if (entityProjection.DiscriminatorExpression != null)
                     {
-                        foreach (var kvp in entityProjection.EntityTypeIdentifyingExpressionMap)
-                        {
-                            AddToProjection(kvp.Value, $"Is{kvp.Key.ShortName()}");
-                        }
+                        AddToProjection(entityProjection.DiscriminatorExpression, DiscriminatorColumnAlias);
                     }
 
                     result[keyValuePair.Key] = Constant(map);
@@ -438,12 +443,9 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                     dictionary[property] = AddToProjection(entityProjection.BindProperty(property));
                 }
 
-                if (entityProjection.EntityTypeIdentifyingExpressionMap != null)
+                if (entityProjection.DiscriminatorExpression != null)
                 {
-                    foreach (var kvp in entityProjection.EntityTypeIdentifyingExpressionMap)
-                    {
-                        AddToProjection(kvp.Value, $"Is{kvp.Key.ShortName()}");
-                    }
+                    AddToProjection(entityProjection.DiscriminatorExpression, DiscriminatorColumnAlias);
                 }
 
                 _entityProjectionCache[entityProjection] = dictionary;
@@ -927,25 +929,20 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                         select2, projection2.BindProperty(property));
                 }
 
-                Dictionary<IEntityType, SqlExpression> entityTypeIdentifyingExpressionMap = null;
-                if (projection1.EntityTypeIdentifyingExpressionMap != null)
+                var discriminatorExpression = projection1.DiscriminatorExpression;
+                if (projection1.DiscriminatorExpression != null)
                 {
-                    entityTypeIdentifyingExpressionMap = new Dictionary<IEntityType, SqlExpression>();
-                    // Both types will have same key since their entity types are same.
-                    foreach (var kvp in projection1.EntityTypeIdentifyingExpressionMap)
-                    {
-                        var entityType = kvp.Key;
-                        entityTypeIdentifyingExpressionMap[entityType] = GenerateEntityTypeIdentifyingExpression(
-                            select1, kvp.Value, select2, projection2.EntityTypeIdentifyingExpressionMap[entityType],
-                            $"Is{entityType.ShortName()}");
-                    }
+                    discriminatorExpression = GenerateDiscriminatorExpression(
+                        select1, projection1.DiscriminatorExpression,
+                        select2, projection2.DiscriminatorExpression,
+                        DiscriminatorColumnAlias);
                 }
 
                 _projectionMapping[projectionMember] = new EntityProjectionExpression(
-                    projection1.EntityType, propertyExpressions, entityTypeIdentifyingExpressionMap);
+                    projection1.EntityType, propertyExpressions, discriminatorExpression);
             }
 
-            ColumnExpression GenerateEntityTypeIdentifyingExpression(
+            ColumnExpression GenerateDiscriminatorExpression(
                 SelectExpression select1, SqlExpression expression1,
                 SelectExpression select2, SqlExpression expression2,
                 string alias)
@@ -1145,22 +1142,15 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                     propertyExpressions[property] = outerColumn;
                 }
 
-                Dictionary<IEntityType, SqlExpression> entityTypeIdentifyingExpressionMap = null;
-                if (entityProjection.EntityTypeIdentifyingExpressionMap != null)
+                ColumnExpression discriminatorExpression = null;
+                if (entityProjection.DiscriminatorExpression != null)
                 {
-                    entityTypeIdentifyingExpressionMap = new Dictionary<IEntityType, SqlExpression>();
-                    foreach (var entityTypeIdentifyingExpression in entityProjection.EntityTypeIdentifyingExpressionMap)
-                    {
-                        var innerProjection = entityTypeIdentifyingExpression.Value;
-                        var outerColumn = subquery.GenerateOuterColumn(
-                            innerProjection, $"Is{entityTypeIdentifyingExpression.Key.ShortName()}");
-                        projectionMap[innerProjection] = outerColumn;
-                        entityTypeIdentifyingExpressionMap[entityTypeIdentifyingExpression.Key] = outerColumn;
-                    }
+                    discriminatorExpression = subquery.GenerateOuterColumn(entityProjection.DiscriminatorExpression, DiscriminatorColumnAlias);
+                    projectionMap[entityProjection.DiscriminatorExpression] = discriminatorExpression;
                 }
 
                 var newEntityProjection = new EntityProjectionExpression(
-                    entityProjection.EntityType, propertyExpressions, entityTypeIdentifyingExpressionMap);
+                    entityProjection.EntityType, propertyExpressions, discriminatorExpression);
 
                 // Also lift nested entity projections
                 foreach (var navigation in entityProjection.EntityType
